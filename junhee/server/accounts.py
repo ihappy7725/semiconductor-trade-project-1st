@@ -24,6 +24,7 @@ from flask import Blueprint, g, jsonify, redirect, render_template, request, ses
 
 from .auth_core import AuthError, ConfirmQueryMiddleware, MailCooldown, SessionStore, SupabaseAuth, public_user
 from .database import is_vercel
+from .configuration import resolve_supabase_url, valid_project_url
 
 ROOT = Path(__file__).resolve().parents[2]
 PROTECTED_PAGES = ('/app', '/_axp_semiconductor/original')  # 두 번째는 minjung 위젯이 만든 원본 워크스페이스 경로
@@ -57,9 +58,7 @@ def _env_bool(name, default):
 def _config_problem(url, key, secret):
     if not isinstance(secret, str) or len(secret) < 32:
         return 'FLASK_SECRET_KEY(32자 이상 무작위 문자열)'
-    parts = urlsplit(url)
-    if (parts.scheme != 'https' or not parts.hostname or parts.username or parts.password
-            or parts.query or parts.fragment or parts.path not in ('', '/')):
+    if not valid_project_url(url):
         return 'SUPABASE_URL(https 프로젝트 주소)'
     if not key.startswith('sb_publishable_'):
         return 'SUPABASE_PUBLISHABLE_KEY(sb_publishable_ 로 시작하는 공개 키. secret/service_role 키는 쓰지 않음)'
@@ -406,7 +405,11 @@ def attach_accounts(app):
     if app.extensions.get('junhee_accounts'):
         return
     _load_root_env()
-    url = os.environ.get('SUPABASE_URL', '').strip()
+    url = resolve_supabase_url(os.environ.get('SUPABASE_URL', ''),
+                               os.environ.get('AXPORT_DATABASE_URL', ''))
+    if valid_project_url(url):
+        # Workspace and assessment repositories must use the same project URL.
+        os.environ['SUPABASE_URL'] = url
     key = os.environ.get('SUPABASE_PUBLISHABLE_KEY', '').strip()
     secret = os.environ.get('FLASK_SECRET_KEY', '')
     problem = _config_problem(url, key, secret)

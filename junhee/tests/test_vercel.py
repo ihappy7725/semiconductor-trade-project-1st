@@ -11,6 +11,22 @@ from unittest.mock import patch
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_supabase_url_can_be_recovered_from_its_own_pooler(self):
+        from junhee.server.configuration import resolve_supabase_url
+        ref = 'abcdefghijklmnopqrst'
+        db = f'postgresql://postgres.{ref}:test@aws-0-eu-west-1.pooler.supabase.com:6543/postgres'
+        for configured in ('', 'postgresql://wrong-value', 'https://supabase.com/dashboard/project/example', 'https://[invalid'):
+            self.assertEqual(resolve_supabase_url(configured, db), f'https://{ref}.supabase.co')
+        self.assertEqual(resolve_supabase_url('https://custom.example/', db), 'https://custom.example')
+        self.assertEqual(resolve_supabase_url('SUPABASE_URL="https://custom.example"', db), 'https://custom.example')
+
+    def test_supabase_url_is_not_inferred_from_an_untrusted_host(self):
+        from junhee.server.configuration import resolve_supabase_url, valid_project_url
+        for host in ('attacker.example', 'pooler.supabase.com.attacker.example'):
+            db = f'postgresql://postgres.abcdefghijklmnopqrst:test@{host}:6543/postgres'
+            self.assertEqual(resolve_supabase_url('', db), '')
+        self.assertFalse(valid_project_url('https://[invalid'))
+
     def test_bad_database_values_are_rejected_without_exposing_them(self):
         from junhee.server.database import connect
         for value in ('sb_secret_private', 'postgresql://user:[YOUR-PASSWORD]@host:6543/postgres',

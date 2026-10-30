@@ -75,6 +75,10 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 
 ## 4. 배포 주소 연결
 
+`SUPABASE_URL`이 비었거나 잘못된 형식이면, 앱은 `AXPORT_DATABASE_URL`의
+Supabase 공식 풀러 사용자명 또는 직접 연결 호스트에 포함된 프로젝트 ID로 공개 API URL을 복원한다.
+정상적인 `SUPABASE_URL`이 지정되어 있으면 그 값을 우선하며, 일반 PostgreSQL 주소에서는 URL을 추측하지 않는다.
+
 배포 후 실제 주소를 확인해서 `AXPORT_PUBLIC_URL`에 반영하고 **Redeploy**한다.
 Supabase **Authentication → URL Configuration**에도 다음을 등록한다.
 
