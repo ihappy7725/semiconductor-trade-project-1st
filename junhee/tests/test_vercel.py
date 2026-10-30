@@ -11,6 +11,36 @@ from unittest.mock import patch
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_bad_database_values_are_rejected_without_exposing_them(self):
+        from junhee.server.database import connect
+        for value in ('sb_secret_private', 'postgresql://user:[YOUR-PASSWORD]@host:6543/postgres',
+                      'postgresql://user:private#password@host:6543/postgres'):
+            with self.subTest(value_type=value.split(':')[0]):
+                with patch.dict(os.environ, {'AXPORT_DATABASE_URL': value}):
+                    with self.assertRaises(sqlite3.Error) as error:
+                        connect('', scope='auth')
+                    self.assertIn('AXPORT_DB_URL_INVALID', str(error.exception))
+                    self.assertNotIn(value, str(error.exception))
+
+    def test_database_failures_report_safe_actionable_categories(self):
+        from junhee.server.database import connect
+        url = 'postgresql://postgres.project:private_password@host:6543/postgres'
+        cases = [(ImportError('private driver details'), 'AXPORT_DB_DRIVER_MISSING'),
+                 (RuntimeError('password authentication failed private_password'), 'AXPORT_DB_AUTH_FAILED'),
+                 (RuntimeError('could not translate host private_password'), 'AXPORT_DB_HOST_NOT_FOUND'),
+                 (RuntimeError('connection timeout private_password'), 'AXPORT_DB_TIMEOUT'),
+                 (RuntimeError('Tenant or user not found private_password'), 'AXPORT_DB_USER_NOT_FOUND')]
+        for exception, category in cases:
+            with self.subTest(category=category):
+                with patch.dict(os.environ, {'AXPORT_DATABASE_URL': url}):
+                    with patch('junhee.server.database.PostgresConnection', side_effect=exception):
+                        with self.assertLogs('junhee.server.database', level='ERROR') as logs:
+                            with self.assertRaises(sqlite3.Error) as error:
+                                connect('', scope='auth')
+                self.assertIn(category, str(error.exception))
+                self.assertNotIn('private_password', str(error.exception))
+                self.assertNotIn('private_password', ''.join(logs.output))
+
     def test_vercel_never_falls_back_to_ephemeral_sessions(self):
         from junhee.server.database import connect
         with patch.dict(os.environ, {'VERCEL': '1', 'AXPORT_DATABASE_URL': ''}):

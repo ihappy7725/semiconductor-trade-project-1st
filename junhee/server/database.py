@@ -4,9 +4,58 @@ The adapter covers only the SQL used by this application. Tokens remain encrypte
 by SessionStore, and uploaded bytes stay in the database, never in public static/.
 """
 import os
+import logging
 from pathlib import Path
 import re
 import sqlite3
+from urllib.parse import urlsplit
+
+log = logging.getLogger(__name__)
+
+
+def validate_database_url(url):
+    """Report configuration mistakes without ever echoing credentials."""
+    try:
+        parts = urlsplit(url)
+        valid = (parts.scheme in ('postgres', 'postgresql') and parts.hostname
+                 and parts.username and parts.password and parts.path not in ('', '/')
+                 and not parts.fragment and not any(c.isspace() for c in url)
+                 and parts.netloc.count('@') == 1
+                 and not re.search(r'%(?![0-9a-fA-F]{2})', url)
+                 and '[your-password]' not in url.lower())
+        parts.port  # Validate the port, if one was supplied.
+    except ValueError:
+        valid = False
+    if not valid:
+        raise sqlite3.OperationalError(
+            'AXPORT_DB_URL_INVALID: AXPORT_DATABASE_URL must be the full PostgreSQL pooler URI. '
+            'Replace the password placeholder and URL-encode password special characters.')
+
+
+def connection_problem(exc):
+    """Classify the driver error locally; output only fixed, credential-free text."""
+    state = getattr(exc, 'sqlstate', None)
+    detail = str(exc).lower()
+    if isinstance(exc, ImportError):
+        return 'AXPORT_DB_DRIVER_MISSING: install psycopg[binary] from requirements.txt.'
+    if state in ('28P01', '28000') or 'password authentication failed' in detail:
+        return 'AXPORT_DB_AUTH_FAILED: check the database password and pooler username.'
+    if 'tenant or user not found' in detail:
+        return 'AXPORT_DB_USER_NOT_FOUND: copy the pooler hostname and username from the same Supabase project.'
+    if state == '42501':
+        return 'AXPORT_DB_PERMISSION_DENIED: the database user needs permission to create the axport_server schema.'
+    if any(word in detail for word in ('could not translate host', 'name or service not known',
+                                       'getaddrinfo', 'failed to resolve', 'nodename nor servname')):
+        return 'AXPORT_DB_HOST_NOT_FOUND: check the pooler hostname in AXPORT_DATABASE_URL.'
+    if 'timeout' in detail or 'timed out' in detail:
+        return 'AXPORT_DB_TIMEOUT: check that Supabase is running and the transaction pooler is reachable.'
+    if any(word in detail for word in ('network is unreachable', 'connection refused', 'no route to host')):
+        return 'AXPORT_DB_UNREACHABLE: use the Supabase transaction pooler and check database network restrictions.'
+    if 'ssl' in detail or 'certificate' in detail:
+        return 'AXPORT_DB_TLS_FAILED: check the pooler endpoint and its TLS configuration.'
+    if state and re.fullmatch(r'[A-Z0-9]{5}', str(state)):
+        return f'AXPORT_DB_CONNECT_FAILED: PostgreSQL SQLSTATE {state}.'
+    return 'AXPORT_DB_CONNECT_FAILED: database initialization failed; verify the pooler URI and driver installation.'
 
 
 def is_vercel():
@@ -156,11 +205,14 @@ class PostgresConnection:
 def connect(path, *, scope, timeout=10):
     url = os.environ.get('AXPORT_DATABASE_URL', '').strip()
     if url:
+        validate_database_url(url)
         try:
             return PostgresConnection(url, scope)
-        except Exception:
-            # Do not include the connection string/password in error responses.
-            raise sqlite3.OperationalError('Shared database connection failed') from None
+        except Exception as exc:
+            # Never log raw driver messages: they can contain the URI/password.
+            problem = connection_problem(exc)
+            log.error('%s', problem)
+            raise sqlite3.OperationalError(problem) from None
     if is_vercel():
         raise sqlite3.OperationalError('AXPORT_DATABASE_URL is required on Vercel')
     db = sqlite3.connect(path, timeout=timeout)
