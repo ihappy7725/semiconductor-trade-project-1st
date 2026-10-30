@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 from flask import Blueprint, g, jsonify, redirect, render_template, request, session
 
 from .auth_core import AuthError, ConfirmQueryMiddleware, MailCooldown, SessionStore, SupabaseAuth, public_user
+from .database import is_vercel
 
 ROOT = Path(__file__).resolve().parents[2]
 PROTECTED_PAGES = ('/app', '/_axp_semiconductor/original')  # 두 번째는 minjung 위젯이 만든 원본 워크스페이스 경로
@@ -411,7 +412,7 @@ def attach_accounts(app):
     problem = _config_problem(url, key, secret)
     on_render = bool(os.environ.get('RENDER'))
     ext = {'app': app, 'ready': problem is None, 'problem': problem, 'auth_hits': {}, 'auth_lock': threading.Lock()}
-    if on_render or _env_bool('AXPORT_TRUST_PROXY', False):
+    if on_render or is_vercel() or _env_bool('AXPORT_TRUST_PROXY', False):
         # Render 는 TLS 를 앞단 프록시에서 끝낸다. X-Forwarded-Proto/For 를 1단계만 믿는다.
         from werkzeug.middleware.proxy_fix import ProxyFix
         app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
@@ -423,7 +424,7 @@ def attach_accounts(app):
         db = os.environ.get('AXPORT_AUTH_DB') or str(ROOT / 'instance' / 'auth-sessions.sqlite3')  # 테스트는 임시 경로
         app.config.update(
             SECRET_KEY=secret, SESSION_COOKIE_NAME='axport_session', SESSION_COOKIE_HTTPONLY=True,
-            SESSION_COOKIE_SECURE=_env_bool('SESSION_COOKIE_SECURE', on_render), SESSION_COOKIE_SAMESITE='Lax',
+            SESSION_COOKIE_SECURE=_env_bool('SESSION_COOKIE_SECURE', on_render or is_vercel()), SESSION_COOKIE_SAMESITE='Lax',
             SESSION_REFRESH_EACH_REQUEST=False, PERMANENT_SESSION_LIFETIME=timedelta(days=7))
         ext.update(provider=SupabaseAuth(url, key), sessions=SessionStore(db, secret),
                    cooldown=MailCooldown(db, secret, MAIL_COOLDOWN_SECONDS))

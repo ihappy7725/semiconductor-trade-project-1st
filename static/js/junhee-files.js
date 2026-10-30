@@ -110,7 +110,8 @@
   async function uploadCompanyFile(file) {
     if (!file) return;
     if (!/\.(xlsx|xls)$/i.test(file.name)) return W.toast("엑셀 파일(.xlsx, .xls)을 선택해 주세요.");
-    if (file.size <= 0 || file.size > 20 * 1024 * 1024) return W.toast("0바이트보다 크고 20 MB 이하인 파일을 선택해 주세요.");
+    const limitMb = Number(document.querySelector('meta[name="axport-upload-limit-mb"]')?.content) || 20;
+    if (file.size <= 0 || file.size > limitMb * 1024 * 1024) return W.toast(`0바이트보다 크고 ${limitMb} MB 이하인 파일을 선택해 주세요.`);
     if (!auth) return W.toast("로그인한 뒤 올릴 수 있습니다.");
     W.toast(`${file.name} 을(를) 올리는 중입니다…`);
     const fd = new FormData();

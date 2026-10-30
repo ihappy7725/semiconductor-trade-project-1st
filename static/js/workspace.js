@@ -1166,8 +1166,9 @@
         "엑셀 파일(.xlsx, .xls)을 선택해 주세요.";
       return;
     }
-    if (file.size > 20 * 1024 * 1024) {
-      $("#upload-error").textContent = "20 MB 이하의 파일을 선택해 주세요.";
+    const limitMb = Number(document.querySelector('meta[name="axport-upload-limit-mb"]')?.content) || 20;
+    if (file.size > limitMb * 1024 * 1024) {
+      $("#upload-error").textContent = `${limitMb} MB 이하의 파일을 선택해 주세요.`;
       return;
     }
     pendingFile = { name: file.name, size: file.size, sample: false, raw: file, hashing: !ENGINE_ONLY, match: null };

@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from .market_data import collect_market, validate_inputs
 from .market_wsts import MAX_FILE_BYTES, parse_wsts
+from ..database import connect, prepare_directory
 
 
 class MarketError(Exception):
@@ -163,9 +164,8 @@ class MarketStore:
 
     @contextmanager
     def _journal_connection(self):
-        self.deletion_journal_path.parent.mkdir(parents=True, exist_ok=True)
-        with closing(sqlite3.connect(str(self.deletion_journal_path), timeout=10)) as db:
-            db.row_factory = sqlite3.Row
+        prepare_directory(self.deletion_journal_path.parent)
+        with closing(connect(str(self.deletion_journal_path), scope='journal')) as db:
             # FULL is SQLite's normal durability level; state it explicitly for
             # the small journal that bridges local storage and remote metadata.
             db.execute('PRAGMA synchronous=FULL')
@@ -208,9 +208,8 @@ class MarketStore:
 
     def _connect(self):
         with self._lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            db = sqlite3.connect(str(self.path), timeout=10)
-            db.row_factory = sqlite3.Row
+            prepare_directory(self.path.parent)
+            db = connect(str(self.path), scope='analysis')
             db.execute('PRAGMA journal_mode=WAL')
             db.executescript('''
                 CREATE TABLE IF NOT EXISTS market_sources (

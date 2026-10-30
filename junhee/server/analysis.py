@@ -35,6 +35,7 @@ from .engine.market_service import MarketError
 from .engine.company_import import parse_company, validate_conditions
 from .engine_adapter import missing_inputs, to_handoff
 from .workspace_store import SupabaseRest, WorkspaceError
+from .database import is_vercel, remote_enabled, prepare_directory
 
 ROOT = Path(__file__).resolve().parents[2]
 SAMPLES = ROOT / 'junhee' / 'data' / 'engine_samples.json'  # sanghyeob 샘플(상세양식) + 간편입력 예시
@@ -124,7 +125,7 @@ class JunheeAnalysis(CompanyAnalysis):
     def reap_orphans(self):
         """(2026-09-27 배포 QA) 실행하던 워커 프로세스가 없어진 '진행 중' 분석을 실패로 정리한다(POSIX 만: gunicorn 워커 재시작 등).
         같은 서버의 다른 워커가 실행 중인 분석은 그 pid 가 살아 있으므로 건드리지 않는다."""
-        if os.name != 'posix':
+        if os.name != 'posix' or remote_enabled():
             return
         with self.store.connection() as db:
             rows = db.execute("SELECT a.user_id, a.id, o.pid FROM market_assessments a JOIN junhee_job_owner o ON o.assessment_id = a.id "
@@ -200,7 +201,7 @@ class JunheeAnalysis(CompanyAnalysis):
         """이 계정 원본을 이미 작업 데이터 폴더에 저장했으면 그 파일 이름(같은 파일을 다시 올려도 새로 쓰지 않음)."""
         with self.store.connection() as db:
             row = db.execute('SELECT file_name FROM junhee_company_files WHERE user_id=? AND source_id=?', (user_id, source_id)).fetchone()
-        return row[0] if row and (COMPANY_FILE_DIR / row[0]).is_file() else None
+        return row[0] if row and (remote_enabled() or (COMPANY_FILE_DIR / row[0]).is_file()) else None
 
     def remember_company_file(self, user_id, source_id, file_name):
         with self.store.connection() as db:
@@ -264,6 +265,14 @@ def _remote_error(exc):
     return jsonify(error=exc.code, message='계정 저장소에 연결하지 못했습니다.'), exc.status
 
 
+def upload_bytes(file):
+    limit_mb = 4 if is_vercel() else 20
+    data = file.read(limit_mb * 1024 * 1024 + 1)
+    if not data or len(data) > limit_mb * 1024 * 1024:
+        raise MarketError('invalid_upload', f'0바이트보다 크고 {limit_mb} MB 이하인 파일을 선택해 주세요.')
+    return data
+
+
 def _status(item):
     return {'assessment_id': item['assessment_id'], 'status': item['status'], 'progress': item.get('progress'),
             'error': item.get('error')}
@@ -274,7 +283,7 @@ def upload_source():
     files = request.files.getlist('file')
     if len(files) != 1 or len(request.files) != 1:
         raise MarketError('invalid_upload', '기업 엑셀 한 개를 선택해 주세요.')
-    return jsonify(service().upload(current_user()['id'], files[0].read(MAX_COMPANY_BYTES + 1), files[0].filename)), 201
+    return jsonify(service().upload(current_user()['id'], upload_bytes(files[0]), files[0].filename)), 201
 
 
 @bp.get('/api/analysis/sources/<source_id>/file')
@@ -334,9 +343,7 @@ def upload_company_file():
     if len(files) != 1 or len(request.files) != 1:
         raise MarketError('invalid_upload', '기업 엑셀 한 개를 선택해 주세요.')
     stem, ext = _safe_file_name(files[0].filename)
-    data = files[0].read(MAX_COMPANY_BYTES + 1)
-    if not data or len(data) > MAX_COMPANY_BYTES:
-        raise MarketError('invalid_upload', '0바이트보다 크고 20 MB 이하인 파일을 선택해 주세요.')
+    data = upload_bytes(files[0])
     try:
         company = parse_company(data, f'{stem}.{ext}')
     except ValueError as exc:
@@ -344,6 +351,13 @@ def upload_company_file():
     user_id = current_user()['id']
     uploaded = service().upload(user_id, data, f'{stem}.{ext}')  # 계정 원본 등록이 먼저(보관 한도 초과 등이면 파일을 남기지 않음)
     source_id = uploaded['company_id'][7:]
+    if remote_enabled():
+        # The source bytes are already durable in PostgreSQL. Do not duplicate
+        # them in Vercel's read-only project directory.
+        name = f'{stem}.{ext}'
+        service().remember_company_file(user_id, source_id, name)
+        return jsonify(company_id=uploaded['company_id'], name=name, size=len(data),
+                       saved_path='계정 파일 보관함', missing=missing_inputs(company)), 201
     known = service().company_file(user_id, source_id)
     if known:  # (검토 반영) 같은 내용을 다시 올리면 새 파일을 쓰지 않는다 → 반복 업로드로 서버 디스크가 차지 않음
         target = COMPANY_FILE_DIR / known
@@ -425,17 +439,17 @@ def attach_analysis(app):
     if ext['ready']:
         repository = AssessmentRepository(SupabaseRest(os.environ['SUPABASE_URL'].strip(), os.environ['SUPABASE_PUBLISHABLE_KEY'].strip()))
     database = os.environ.get('AXPORT_ANALYSIS_DB') or str(ROOT / 'instance' / 'company-assessments.sqlite3')
-    Path(database).parent.mkdir(parents=True, exist_ok=True)
+    prepare_directory(Path(database).parent)
 
     def keys():
         return {name: os.environ.get(name, '').strip() for name in KEY_NAMES}
 
     app.extensions['junhee_analysis'] = JunheeAnalysis(database, ROOT, keys, repository,
-                                                       inline=os.environ.get('AXPORT_ANALYSIS_INLINE') == '1')
+                                                       inline=is_vercel() or os.environ.get('AXPORT_ANALYSIS_INLINE') == '1')
 
     @app.before_request
     def _upload_limit():
         # 기업 엑셀 업로드 경로만 20MB 까지 허용(나머지 요청 크기 제한은 그대로)
         if request.path in ('/api/analysis/sources', '/api/analysis/company-files'):  # (검토 반영) 기업 파일 업로드도 20MB
-            request.max_content_length = MAX_COMPANY_BYTES + 64 * 1024
+            request.max_content_length = (4 * 1024 * 1024 if is_vercel() else MAX_COMPANY_BYTES) + 64 * 1024
     app.register_blueprint(bp)

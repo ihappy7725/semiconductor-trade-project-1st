@@ -2,6 +2,7 @@
 <html lang="ko">
   <head>
     <meta charset="utf-8" />
+    <meta name="axport-upload-limit-mb" content="{{ upload_limit_mb | default(20) }}" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>워크스페이스 · AXPORT</title>
     <link rel="icon" href="/static/assets/axport-logo.png" />
@@ -250,7 +251,7 @@
         <label id="drop-zone" class="drop-zone" for="excel-input"
           ><i class="ph ph-microsoft-excel-logo"></i
           ><strong id="file-label">엑셀 파일을 끌어 놓거나 선택하세요</strong
-          ><span>.xlsx, .xls · 파일당 최대 20 MB</span
+          ><span>.xlsx, .xls · 파일당 최대 {{ upload_limit_mb | default(20) }} MB</span
           ><input id="excel-input" type="file" accept=".xlsx,.xls"
         /></label>
         <div class="upload-privacy">

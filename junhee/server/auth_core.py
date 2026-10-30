@@ -22,6 +22,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from .database import connect, prepare_directory
 
 
 class AuthError(Exception):
@@ -184,7 +185,7 @@ class SessionStore:
 
     def __init__(self, path, secret_key, ttl=604800, refresh_margin=60):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        prepare_directory(self.path.parent)
         self.ttl = ttl
         self.refresh_margin = refresh_margin
         key = HKDF(algorithm=hashes.SHA256(), length=32, salt=b'axport-auth-session-v1',
@@ -198,8 +199,7 @@ class SessionStore:
 
     @contextmanager
     def _connect(self):
-        conn = sqlite3.connect(self.path, timeout=15)
-        conn.row_factory = sqlite3.Row
+        conn = connect(self.path, scope='auth', timeout=15)
         try:
             with conn:
                 yield conn
@@ -312,7 +312,7 @@ class MailCooldown:
 
     @contextmanager
     def _connect(self):
-        db = sqlite3.connect(self.database, timeout=10)
+        db = connect(self.database, scope='auth', timeout=10)
         try:
             with db:
                 yield db

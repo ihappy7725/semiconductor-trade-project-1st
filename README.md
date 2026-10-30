@@ -1,5 +1,8 @@
 # AXPORT
 
+Vercel 배포는 [Vercel 설정 안내](junhee/docs/VERCEL_SETUP.md)를 참고하세요.
+로그인 세션과 업로드 원본을 유지하려면 `AXPORT_DATABASE_URL`에 Supabase PostgreSQL Transaction pooler URI를 설정해야 합니다.
+
 로그인한 사용자가 올린 반도체 기업 Excel(또는 가상 샘플)을 서버 분석 엔진(참고 적합도 v1)으로 분석해 시장성·가격·물류·안정성 참고 점수와 규제 확인 후보를 보여 주는 Flask 앱입니다. 결과는 참고용이며, AXPORT는 수출허가 여부를 최종 판정하지 않습니다.
 
 ## 실행

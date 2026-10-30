@@ -363,7 +363,8 @@
     set($("#sx-upload-title"), own("title"));
     set($(".sx-intro", card), own("intro"));
     set($("#sx-drop strong"), it("엑셀 파일을 끌어 놓거나 선택하세요"));
-    set($("#sx-drop small"), it(".xlsx, .xls · 파일당 최대 20 MB"));
+    const uploadLimitMb = Number(document.querySelector('meta[name="axport-upload-limit-mb"]')?.content) || 20;
+    set($("#sx-drop small"), it(".xlsx, .xls · 파일당 최대 20 MB").replace("20", String(uploadLimitMb)));
     set($(".jd-sx-privacy span"), own("privacy"));
     set($(".sx-company span", card), it("기업명"));
     set($(".sx-fields label:nth-child(2) span", card), it("대상국"));

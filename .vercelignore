@@ -1,0 +1,14 @@
+.venv/
+node_modules/
+.codex-runtime/
+instance/
+.env
+.env.*
+!.env.example
+JH/
+JH2/
+junhee/tests/
+junhee/test-results/
+junhee/data/samples/uploads/
+**/__pycache__/
+*.log

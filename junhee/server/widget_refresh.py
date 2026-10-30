@@ -25,6 +25,8 @@ _started = False
 
 
 def enabled():
+    if os.environ.get('VERCEL') == '1':
+        return False  # Vercel cannot run a persistent writer in static/.
     value = os.environ.get('AXPORT_WIDGET_REFRESH', '').strip()
     return value == '1' if value in ('0', '1') else bool(os.environ.get('RENDER'))
 

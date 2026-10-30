@@ -17,3 +17,5 @@ qa/
 *.env
 # (junhee) Contact Us 접수 파일(개인정보) — 커밋 금지
 instance/
+.vercel/
+.codex-runtime/

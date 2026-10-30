@@ -13,6 +13,13 @@ from flask import jsonify, request
 app = Flask(__name__)
 app.config['TEMPLATES_AUTO_RELOAD'] = True
 
+from junhee.server.database import is_vercel, remote_enabled, connect
+
+
+@app.context_processor
+def deployment_settings():
+    return {'upload_limit_mb': 4 if is_vercel() else 20}
+
 @app.get('/')
 def home():
     return render_template('home.html')
@@ -75,9 +82,22 @@ def contact():
     if errors:
         return jsonify(ok=False, error='invalid', message=' '.join(errors)), 400
     record = {'ts': _datetime.now(_timezone.utc).isoformat(timespec='seconds'), 'type': kind, 'field': field, 'name': name, 'email': email, 'message': message}
-    _os.makedirs(app.instance_path, exist_ok=True)
-    with open(_os.path.join(app.instance_path, 'contact_messages.jsonl'), 'a', encoding='utf-8') as fh:
-        fh.write(_json.dumps(record, ensure_ascii=False) + '\n')
+    if remote_enabled():
+        from contextlib import closing
+        import sqlite3
+        try:
+            with closing(connect('', scope='analysis')) as db:
+                with db:
+                    db.execute('CREATE TABLE IF NOT EXISTS contact_messages (id TEXT PRIMARY KEY, record_json TEXT NOT NULL)')
+                    from uuid import uuid4
+                    db.execute('INSERT INTO contact_messages VALUES (?, ?)',
+                               (str(uuid4()), _json.dumps(record, ensure_ascii=False)))
+        except sqlite3.Error:
+            return jsonify(ok=False, error='unavailable', message='문의를 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.'), 503
+    else:
+        _os.makedirs(app.instance_path, exist_ok=True)
+        with open(_os.path.join(app.instance_path, 'contact_messages.jsonl'), 'a', encoding='utf-8') as fh:
+            fh.write(_json.dumps(record, ensure_ascii=False) + '\n')
     return jsonify(ok=True)  # 저장 내용은 되돌려 주지 않는다
 
 # Register for both python app.py and WSGI imports; keep team routes intact.
