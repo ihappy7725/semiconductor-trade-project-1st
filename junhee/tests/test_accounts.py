@@ -189,6 +189,25 @@ class Flow(unittest.TestCase):
         self.assertIn('유효하지 않거나 만료', r.get_data(as_text=True))
         self.provider.confirm_email.assert_not_called()
 
+    def test_default_email_callback_returns_to_password_login_without_session(self):
+        # Supabase's default template verifies the token before this callback.
+        # Visiting the callback alone must never grant an application session.
+        response = self.c.get('/auth/confirm')
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers['Location'], '/app?auth=email_return#email-confirmation')
+        self.provider.confirm_email.assert_not_called()
+        self.provider.sign_in.assert_not_called()
+        with self.c.session_transaction() as state:
+            self.assertNotIn('auth_sid', state)
+        response = self.c.get('/app?auth=email_return')
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('인증 메일 확인을 마쳤다면', response.get_data(as_text=True))
+
+    def test_default_email_callback_error_does_not_claim_success(self):
+        response = self.c.get('/auth/confirm?error=access_denied&error_code=otp_expired', follow_redirects=True)
+        self.assertIn('인증 링크가 유효하지 않거나 만료', response.get_data(as_text=True))
+        self.provider.confirm_email.assert_not_called()
+
     def test_confirm_link_at_site_root(self):
         # (2026-09-28) Supabase 가 Site URL(루트)로 보낸 인증 링크도 /auth/confirm 과 같이 처리
         self.provider.confirm_email.return_value = {'user': USER, 'access_token': 'verify-token'}

@@ -324,6 +324,13 @@ def resend():
 @bp.get('/auth/confirm')
 def confirm_email():
     pairs = request.environ.pop('axport.confirm_query', [])
+    if not pairs:
+        # The default Supabase email verifies at /auth/v1/verify first and
+        # returns session tokens in the browser fragment. Do not consume these
+        # tokens or claim confirmation here: normal password login still checks
+        # the account with Supabase. An explicit harmless fragment prevents a
+        # redirect from forwarding provider tokens to the next page.
+        return redirect('/app?auth=email_return#email-confirmation', code=303)
     values = dict(pairs)
     state = 'invalid'
     if (len(pairs) == 2 and set(values) == {'token_hash', 'type'} and values['type'] == 'email'
@@ -456,6 +463,7 @@ def attach_accounts(app):
         if api:
             return jsonify(error='authentication_required'), 401
         notice = {'expired': '로그인이 만료되었습니다. 다시 로그인해 주세요.', 'logged_out': '로그아웃되었습니다.',
+                  'email_return': '인증 메일 확인을 마쳤다면 이메일과 비밀번호로 로그인해 주세요.',
                   'logout_pending': '이 브라우저에서 로그아웃되었습니다. 인증 서버 연결은 잠시 후 다시 확인해 주세요.'
                   }.get(request.args.get('auth'), '')
         return _page(tab='signup' if request.args.get('signup') == '1' else 'login', notice=notice)

@@ -12,8 +12,10 @@ sanghyeob 작업본의 Supabase 로그인을 junhee 구조로 옮겼다. 코드:
    **Redirect URLs** 에 인증 링크 주소를 등록한다(빠지면 인증 링크가 Site URL 로 가서 인증이 조용히 실패한다).
    - 로컬: `http://127.0.0.1:5073/auth/confirm`, `http://localhost:5073/auth/confirm`
    - Render: `https://<서비스 이름>.onrender.com/auth/confirm`
-4. **Authentication → Emails → Confirm signup** 본문을 `junhee/supabase/templates/confirm_signup.html` 로 바꾼다.
-   링크가 `{{ .RedirectTo }}?token_hash={{ .TokenHash }}&type=email` 형식이어야 한다.
+4. **Authentication → Emails → Confirm signup** 기본 메일 양식을 그대로 사용할 수 있다.
+   기본 양식은 Supabase에서 인증을 마친 뒤 `/auth/confirm`으로 돌아오며, 앱은 비밀번호 로그인 화면으로 안내한다.
+   커스텀 SMTP를 설정하고 앱의 인증 완료 안내를 사용하려면 본문을 `junhee/supabase/templates/confirm_signup.html`로 바꾼다.
+   커스텀 링크는 `{{ .RedirectTo }}?token_hash={{ .TokenHash }}&type=email` 형식을 사용한다.
 5. 인증 메일 발송: Supabase 기본 메일은 **프로젝트 팀원 주소로만, 시간당 몇 통**만 보낸다. 다른 주소로 받으려면
    **Authentication → Emails → SMTP Settings** 에 SMTP(예: Gmail 앱 비밀번호, Mailtrap, Resend)를 넣는다.
    메일 계정 정보는 Supabase 에만 넣고 이 저장소·.env 에는 두지 않는다.
