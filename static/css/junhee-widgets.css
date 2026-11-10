@@ -1019,8 +1019,8 @@ body.axsx-preview .jd-sx-privacy {
   align-items: center;
   gap: 6px;
   margin: 8px 0 clamp(6px, 1.4vh, 14px);
-  font-size: 10.5px;
-  color: #94a3b8;
+  font-size: 13px;
+  color: #526580;
   line-height: 1.6;
 }
 body.axsx-preview .jd-sx-privacy i {
@@ -1219,5 +1219,53 @@ body.axsx-preview .sx-editing .jd-upload-form .sx-form-actions {
 @media (min-width: 901px) {
   body.axsx-preview #sx-canvas:not(.sx-free) .sx-upload {
     transform: translateX(var(--jd-upload-shift, 0px));
+  }
+}
+
+/* Keep progress readable while the indicator moves; never blink the text. */
+#upload-dialog .demo-notice.is-analysis-busy,
+body.axsx-preview .jd-sx-privacy.is-analysis-busy {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 15px 18px;
+  margin: 14px 0 18px;
+  border: 1px solid #93b8ff;
+  border-radius: 12px;
+  background: #eff6ff;
+  color: #1746a2;
+  font-size: clamp(15px, 1.1vw, 16px);
+  font-weight: 700;
+  line-height: 1.65;
+  animation: analysis-progress-glow 2s ease-in-out infinite;
+}
+body.axsx-preview .jd-sx-privacy.is-analysis-busy i {
+  display: none;
+}
+#upload-dialog .demo-notice.is-analysis-busy::before,
+body.axsx-preview .jd-sx-privacy.is-analysis-busy::before {
+  content: "";
+  flex: 0 0 20px;
+  width: 20px;
+  height: 20px;
+  box-sizing: border-box;
+  border: 3px solid #bfd5ff;
+  border-top-color: #2563eb;
+  border-radius: 50%;
+  animation: analysis-progress-spin 0.9s linear infinite;
+}
+@keyframes analysis-progress-spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes analysis-progress-glow {
+  0%, 100% { box-shadow: 0 0 0 0 rgb(37 99 235 / 0%); }
+  50% { box-shadow: 0 0 0 4px rgb(37 99 235 / 12%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  #upload-dialog .demo-notice.is-analysis-busy,
+  #upload-dialog .demo-notice.is-analysis-busy::before,
+  body.axsx-preview .jd-sx-privacy.is-analysis-busy,
+  body.axsx-preview .jd-sx-privacy.is-analysis-busy::before {
+    animation: none;
   }
 }

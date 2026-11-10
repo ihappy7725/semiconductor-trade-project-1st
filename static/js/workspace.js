@@ -1299,6 +1299,10 @@
     const note = $("#upload-dialog .demo-notice"), noteText = note ? note.textContent : "", btn = $('#analysis-form button[type="submit"]');
     const same = submitted.assessment_id && submitted.conditions && submitted.conditions.company === company && submitted.conditions.hs === hs && submitted.conditions.country === country;
     engineBusy = true;
+    if (note) {
+      note.classList.add("is-analysis-busy");
+      note.setAttribute("role", "status");
+    }
     if (btn) btn.disabled = true;
     $("#upload-error").textContent = "";
     try {
@@ -1335,7 +1339,11 @@
     } finally {
       engineBusy = false;
       if (btn) btn.disabled = false;
-      if (note) note.textContent = noteText;
+      if (note) {
+        note.textContent = noteText;
+        note.classList.remove("is-analysis-busy");
+        note.removeAttribute("role");
+      }
       window.dispatchEvent(new CustomEvent("axp:analysis-progress", { detail: { message: "", busy: false } })); // (junhee)
     }
   }

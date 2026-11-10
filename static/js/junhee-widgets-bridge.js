@@ -172,6 +172,10 @@
     const d = (e && e.detail) || {}, btn = $("#sx-form .sx-primary"), note = $(".jd-sx-privacy span");
     if (btn) btn.disabled = !!d.busy;
     if (!note) return;
+    const container = note.closest(".jd-sx-privacy");
+    container?.classList.toggle("is-analysis-busy", !!d.busy);
+    if (d.busy) container?.setAttribute("role", "status");
+    else container?.removeAttribute("role");
     if (d.busy) {
       if (privacyText == null) privacyText = note.textContent;
       note.textContent = d.message || "분석 중입니다…";
@@ -365,7 +369,7 @@
     set($("#sx-drop strong"), it("엑셀 파일을 끌어 놓거나 선택하세요"));
     const uploadLimitMb = Number(document.querySelector('meta[name="axport-upload-limit-mb"]')?.content) || 20;
     set($("#sx-drop small"), it(".xlsx, .xls · 파일당 최대 20 MB").replace("20", String(uploadLimitMb)));
-    set($(".jd-sx-privacy span"), own("privacy"));
+    if (privacyText == null) set($(".jd-sx-privacy span"), own("privacy"));
     set($(".sx-company span", card), it("기업명"));
     set($(".sx-fields label:nth-child(2) span", card), it("대상국"));
     set($(".sx-fields .jd-field-hint", card), own("hsHint"));
