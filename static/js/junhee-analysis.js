@@ -84,7 +84,7 @@
       throw e;
     }
     const started = Date.now();
-    const deadline = started + 6 * 60 * 1000;
+    const deadline = started + 15 * 60 * 1000;
     const waiting = () => progress(`5개국 무역통계·환율·규제 자료를 조회하고 분석합니다… (${Math.floor((Date.now() - started) / 1000)}초 경과)`);
     waiting();
     // Vercel executes the analysis inside this POST (up to 300 seconds).
@@ -108,12 +108,19 @@
       progress(st.progress || "분석 중입니다…");
       if (Date.now() >= deadline) throw new Error("분석이 너무 오래 걸립니다. 서버에서는 계속 진행될 수 있으니 잠시 후 같은 조건으로 다시 분석하면 이어서 확인합니다.");
       await sleep(fails ? Math.min(1500 * 2 ** fails, 12000) : 1500);
+      const stageMessage = st.progress || "보고서 근거를 수집합니다…";
+      const stageFeedback = setInterval(() => progress(`${stageMessage} (${Math.floor((Date.now() - started) / 1000)}초 경과)`), 1000);
       try {
-        st = await request(`/api/analysis/assessments/${st.assessment_id}`, {}, Math.max(1, Math.min(30000, deadline - Date.now())));
+        const url = `/api/analysis/assessments/${encodeURIComponent(st.assessment_id)}`;
+        st = st.stepwise
+          ? await request(url + "/advance", { method: "POST" }, Math.max(1, Math.min(150000, deadline - Date.now())))
+          : await request(url, {}, Math.max(1, Math.min(30000, deadline - Date.now())));
         fails = 0;
       } catch (e) {
         const transient = !e.status || e.status >= 500 || e.status === 429;
         if (!transient || ++fails > 5) throw new Error(readable(e, "분석 진행 상태를 확인하지 못했습니다."));
+      } finally {
+        clearInterval(stageFeedback);
       }
     }
     if (st.status !== "COMPLETED") throw new Error(st.progress || "분석을 완료하지 못했습니다.");

@@ -25,6 +25,7 @@ import re
 import sqlite3
 import threading
 import time
+from uuid import uuid4
 
 from flask import Blueprint, current_app, jsonify, request, send_file
 
@@ -146,11 +147,106 @@ class JunheeAnalysis(CompanyAnalysis):
             company['sample'] = True
         return company
 
-    def run(self, user_id, assessment_id, inputs, company):
+    def enqueue(self, user_id, assessment_id, inputs, company):
+        inputs['execution_mode'] = 'steps'
+        data = {'inputs': inputs, 'company': company, 'prepared': {'trades': {}}}
+        with self.store.connection() as db:
+            db.execute('INSERT INTO analysis_steps VALUES (?, ?, ?, ?, ?)',
+                       (assessment_id, user_id, json.dumps(data, ensure_ascii=False, allow_nan=False), 0, ''))
+            db.execute('UPDATE market_assessments SET inputs_json=? WHERE id=? AND user_id=?',
+                       (json.dumps(inputs, ensure_ascii=False), assessment_id, user_id))
+
+    def advance(self, user_id, token, assessment_id):
+        """One bounded step per HTTP request, checkpointed in the shared DB.
+
+        A lease makes duplicate clicks/polls safe across server instances. No
+        background threads or tokens survive beyond the current request.
+        """
+        from .engine.analysis_policy import CANDIDATES, COUNTRY_NAMES
+        from .engine.analysis_fx import collect_fx
+        from .engine.request_budget import BudgetSession
+        item = self.store.get(user_id, assessment_id)
+        if item['status'] not in ('QUEUED', 'RUNNING'):
+            return item
+        lease = str(uuid4())
+        with self.store.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            claimed = db.execute('UPDATE analysis_steps SET lease_until=?, lease_token=? '
+                                 'WHERE assessment_id=? AND user_id=? AND lease_until<?',
+                                 (time.time() + 180, lease, assessment_id, user_id, time.time()))
+            if claimed.rowcount != 1:
+                return item
+            row = db.execute('SELECT data_json FROM analysis_steps WHERE assessment_id=? AND user_id=?',
+                             (assessment_id, user_id)).fetchone()
+            data = json.loads(row[0])
+        inputs, company, prepared = data['inputs'], data['company'], data['prepared']
+        def progress(message):
+            if not self.store.update(user_id, assessment_id, 'RUNNING', message):
+                raise InterruptedError('assessment_no_longer_active')
+        def collect(call, fallback):
+            try:
+                return call()
+            except InterruptedError:
+                raise
+            except Exception:
+                return fallback
+        try:
+            self.tokens[user_id] = token
+            with BudgetSession(60) as session:
+                remaining = [c for c in CANDIDATES if c not in prepared['trades']]
+                if remaining:
+                    country = remaining[0]
+                    progress(f'{COUNTRY_NAMES[country]} 비교 자료를 확인합니다. ({len(prepared["trades"]) + 1}/{len(CANDIDATES)})')
+                    prepared['trades'][country] = self._collect_country(
+                        {**inputs, 'country': country, 'country_name': COUNTRY_NAMES[country]}, progress, session=session)
+                elif 'reference' not in prepared:
+                    progress('한국 전체 수출 기준자료를 확인합니다. (6/9)')
+                    prepared['reference'] = collect(lambda: self._reference(inputs, progress, session=session),
+                        {'monthly_exports': [], 'sources': [], 'status': 'FETCH_ERROR',
+                         'warnings': ['한국 전체 수출 기준자료를 확인하지 못했습니다.']})
+                elif 'fx' not in prepared:
+                    progress('결제통화와 환율을 확인합니다. (7/9)')
+                    prepared['fx'] = collect(lambda: (
+                        self.fx_collector(company, inputs, self.key_provider(), progress=progress)
+                        if self.fx_collector else collect_fx(company, inputs, self.key_provider(), progress=progress, session=session)),
+                        {'metrics': [], 'sources': [], 'warnings': ['결제통화 환율 자료를 확인하지 못했습니다.'],
+                         'checks': [], 'series': [], 'calendar_status': 'UNVERIFIED'})
+                elif 'law' not in prepared:
+                    progress('공식 규제 자료를 확인합니다. (8/9)')
+                    prepared['law'] = collect(lambda: self._law(inputs, progress, session=session),
+                        {'status': 'FETCH_ERROR', 'law': None, 'sources': [], 'checks': [],
+                         'warnings': ['공식 고시 원문을 조회하지 못했습니다. 보유 원문의 효력을 추정하지 않습니다.']})
+                else:
+                    progress('수집된 근거로 보고서를 작성합니다. (9/9)')
+                    self.run(user_id, assessment_id, inputs, company, prepared=prepared)
+            # Raw response bodies are not inputs to calculation or rendering.
+            def compact(value):
+                if isinstance(value, dict):
+                    return {k: compact(v) for k, v in value.items() if k != 'raw'}
+                return [compact(v) for v in value] if isinstance(value, list) else value
+            with self.store.connection() as db:
+                db.execute('UPDATE analysis_steps SET data_json=?, lease_until=0, lease_token=? '
+                           'WHERE assessment_id=? AND user_id=? AND lease_token=?',
+                           (json.dumps(compact(data), ensure_ascii=False, allow_nan=False), '', assessment_id, user_id, lease))
+        except InterruptedError:
+            pass
+        except Exception:
+            log.exception('analysis step failed')
+            self.store.update(user_id, assessment_id, 'FAILED', '보고서 생성 중 오류가 발생했습니다. 다시 시도해 주세요.', error='assessment_failed')
+        finally:
+            with self.store.connection() as db:
+                db.execute('UPDATE analysis_steps SET lease_until=0, lease_token=? '
+                           'WHERE assessment_id=? AND user_id=? AND lease_token=?', ('', assessment_id, user_id, lease))
+                db.execute("DELETE FROM analysis_steps WHERE assessment_id=? AND user_id=? AND assessment_id IN "
+                           "(SELECT id FROM market_assessments WHERE status NOT IN ('QUEUED','RUNNING'))",
+                           (assessment_id, user_id))
+        return self.store.get(user_id, assessment_id)
+
+    def run(self, user_id, assessment_id, inputs, company, prepared=None):
         self.mark_sample(company, inputs)
         self._local.ctx, self._local.text = (company, inputs), None
         try:
-            super().run(user_id, assessment_id, inputs, company)  # COMPLETED 직전에 handoff 저장(_HandoffFirstStore)
+            super().run(user_id, assessment_id, inputs, company, prepared=prepared)  # COMPLETED 직전에 handoff 저장(_HandoffFirstStore)
         finally:
             text, self._local.ctx, self._local.text = self._local.text, None, None
         token = self.tokens.get(user_id)
@@ -275,7 +371,7 @@ def upload_bytes(file):
 
 def _status(item):
     return {'assessment_id': item['assessment_id'], 'status': item['status'], 'progress': item.get('progress'),
-            'error': item.get('error')}
+            'error': item.get('error'), 'stepwise': (item.get('inputs') or {}).get('execution_mode') == 'steps'}
 
 
 @bp.post('/api/analysis/sources')
@@ -327,7 +423,16 @@ def cancel_assessment(assessment_id):
     service().store.get(user_id, assessment_id)  # Ownership check before changing state.
     service().store.update(user_id, assessment_id, 'FAILED',
                            '사용자가 이전 분석을 중단했습니다.', error='user_cancelled')
+    with service().store.connection() as db:
+        db.execute('DELETE FROM analysis_steps WHERE assessment_id=? AND user_id=?', (assessment_id, user_id))
     return jsonify(_status(service().store.get(user_id, assessment_id)))
+
+
+@bp.post('/api/analysis/assessments/<assessment_id>/advance')
+def advance_assessment(assessment_id):
+    if not UUID.fullmatch(assessment_id):
+        raise MarketError('not_found', '분석을 찾을 수 없습니다.', 404)
+    return jsonify(_status(service().advance(current_user()['id'], access_token(), assessment_id)))
 
 
 @bp.delete('/api/analysis/sources/<source_id>')
@@ -462,6 +567,7 @@ def attach_analysis(app):
 
     app.extensions['junhee_analysis'] = JunheeAnalysis(database, ROOT, keys, repository,
                                                        inline=is_vercel() or os.environ.get('AXPORT_ANALYSIS_INLINE') == '1')
+    app.extensions['junhee_analysis'].deferred = is_vercel() or os.environ.get('AXPORT_ANALYSIS_STEPS') == '1'
 
     @app.before_request
     def _upload_limit():

@@ -87,6 +87,7 @@ class CompanyAnalysis:
         self.root = Path(root)
         self.key_provider = key_provider
         self.inline = inline
+        self.deferred = False
         self.executor = None
         self.lock = Lock()
         registry = json.loads((self.root / 'static/data/companies/index.json').read_text(encoding='utf-8-sig'))
@@ -164,7 +165,9 @@ class CompanyAnalysis:
         inputs.update(company_id=payload['company_id'], file_name=company['source']['name'],
                       source_id=source_id, analysis_as_of=timestamp(), policy=policy_snapshot())
         assessment_id = self.store.create(user_id, inputs, source_id)
-        if self.inline:
+        if self.deferred:
+            self.enqueue(user_id, assessment_id, inputs, company)
+        elif self.inline:
             self.run(user_id, assessment_id, inputs, company)
         else:
             try:
@@ -176,7 +179,7 @@ class CompanyAnalysis:
                 self.store.update(user_id, assessment_id, 'FAILED', '분석 작업을 시작하지 못했습니다.', error='worker_unavailable')
         return self.store.get(user_id, assessment_id)
 
-    def _trade(self, inputs, progress):
+    def _trade(self, inputs, progress, session=None):
         from .analysis_market_price import collect_trade
         cache_key = '|'.join([inputs['hs6'], inputs['hs_edition'], inputs['country'], inputs['as_of'], 'company-trade-v5-exact-observations'])
         with self.store.connection() as db:
@@ -186,7 +189,8 @@ class CompanyAnalysis:
         if cached:
             progress('같은 품목·국가의 저장된 공식통계 근거를 확인합니다.')
             return json.loads(cached['result_json'])
-        result = (self.trade_collector or collect_trade)(inputs, self.key_provider(), progress=progress)
+        result = (self.trade_collector(inputs, self.key_provider(), progress=progress)
+                  if self.trade_collector else collect_trade(inputs, self.key_provider(), progress=progress, session=session))
         sources = result.get('sources', [])
         # A successful response can have unpublished months. Preserve those gaps
         # for the daily snapshot, but leave failed or invalid batches retryable.
@@ -226,7 +230,7 @@ class CompanyAnalysis:
                            (cache_key, time.time(), serialized))
         return result
 
-    def _diagnostics(self, trade, inputs):
+    def _diagnostics(self, trade, inputs, session=None):
         from .analysis_trade_metadata import diagnose_missing_months
         latest = month_offset(inputs['as_of'][:7], -1)
         # Covers all four allowed 36-month windows without inspecting the older
@@ -241,23 +245,57 @@ class CompanyAnalysis:
         version = sha256(json.dumps(marks, sort_keys=True).encode()).hexdigest()
         cache_key = '|'.join(['trade-diagnostics-v1', inputs['country'], inputs['hs6'], inputs['hs_edition'], inputs['as_of'], version])
         return self._public_data(cache_key, lambda: (self.trade_diagnoser or diagnose_missing_months)(
-            trade, inputs, self.key_provider(), required_periods=required))
+            trade, inputs, self.key_provider(), required_periods=required,
+            **({} if self.trade_diagnoser else {'session': session})))
 
-    def _reference(self, inputs, progress):
+    def _reference(self, inputs, progress, session=None):
         from .analysis_trade_reference import collect_trade_reference
         cache_key = '|'.join(['kcs-world-reference-v1', inputs['hs6'], inputs['hs_edition'], inputs['as_of']])
         return self._public_data(cache_key, lambda: (self.reference_collector or collect_trade_reference)(
-            inputs, self.key_provider(), progress=progress))
+            inputs, self.key_provider(), progress=progress,
+            **({} if self.reference_collector else {'session': session})))
 
-    def _law(self, inputs, progress):
+    def _law(self, inputs, progress, session=None):
         from .analysis_regulation_law import collect_regulation_law
         # Public current-version lookup, independent of HS/company/country.
         # Include retrieval day so an as_of rerun is not a historical-law claim.
         cache_key = '|'.join(['current-law-v1', inputs['as_of'], timestamp()[:10]])
         return self._public_data(cache_key, lambda: (self.law_collector or collect_regulation_law)(
-            {'as_of': inputs['as_of']}, self.key_provider(), progress=progress))
+            {'as_of': inputs['as_of']}, self.key_provider(), progress=progress,
+            **({} if self.law_collector else {'session': session})))
 
-    def run(self, user_id, assessment_id, inputs, company):
+    def _collect_country(self, scoped, progress, session=None):
+        try:
+            trade = self._trade(scoped, progress, session=session)
+        except InterruptedError:
+            raise
+        except Exception:
+            trade = {'factor': unavailable_factor('market', '시장성', '외부 무역통계를 확인하지 못했습니다.'),
+                              'monthly_imports': [], 'annual_imports': [], 'kcs_exports': [], 'sources': []}
+        try:
+            diagnosis = self._diagnostics(trade, scoped, session=session)
+        except Exception:
+            diagnosis = {'diagnostics': [], 'sources': [], 'checked_periods': [], 'skipped_periods': [],
+                         'reason': '자료 제공 현황의 추가 조회에 실패했습니다. 수입 관측값은 변경하지 않습니다.'}
+        trade['missing_diagnostics'] = diagnosis
+        trade['sources'].extend(diagnosis.get('sources', []))
+        factor = trade['factor']
+        factor.setdefault('checks', []).extend(
+            {'label': f'{d["period"]} 수입 자료 확인', 'status': d['diagnostic_status'], 'detail': d['reason']}
+            for d in diagnosis.get('diagnostics', []))
+        if diagnosis.get('reason'):
+            factor.setdefault('warnings', []).append(diagnosis['reason'])
+        if diagnosis.get('warning'):
+            factor.setdefault('warnings', []).append(diagnosis['warning'])
+        by_period = {d['period']: d for d in diagnosis.get('diagnostics', [])}
+        for observation in trade.get('monthly_imports', []):
+            diagnostic = by_period.get(observation.get('period'))
+            if diagnostic and observation.get('status') == 'MISSING':
+                observation['reason'] = diagnostic['reason']
+                observation['evidence'] = observation.get('evidence', []) + diagnostic.get('evidence', [])
+        return trade
+
+    def run(self, user_id, assessment_id, inputs, company, prepared=None):
         def progress(message):
             if not self.store.update(user_id, assessment_id, 'RUNNING', message):
                 raise InterruptedError('assessment_no_longer_active')
@@ -266,38 +304,14 @@ class CompanyAnalysis:
             from .analysis_risk_logistics import evaluate_regulation, evaluate_logistics, evaluate_stability
             progress('기업 파일과 선택 품목의 연결을 확인합니다.')
             factors = []
-            trades = {}
+            prepared = prepared or {}
+            trades = deepcopy(prepared.get('trades', {}))
             for country in CANDIDATES:
+                if country in trades:
+                    continue
                 scoped = {**inputs, 'country': country, 'country_name': COUNTRY_NAMES[country]}
                 progress(f'{COUNTRY_NAMES[country]} 비교 자료를 확인합니다. ({len(trades) + 1}/{len(CANDIDATES)})')
-                try:
-                    trades[country] = self._trade(scoped, progress)
-                except InterruptedError:
-                    raise
-                except Exception:
-                    trades[country] = {'factor': unavailable_factor('market', '시장성', '외부 무역통계를 확인하지 못했습니다.'),
-                                      'monthly_imports': [], 'annual_imports': [], 'kcs_exports': [], 'sources': []}
-                try:
-                    diagnosis = self._diagnostics(trades[country], scoped)
-                except Exception:
-                    diagnosis = {'diagnostics': [], 'sources': [], 'checked_periods': [], 'skipped_periods': [],
-                                 'reason': '자료 제공 현황의 추가 조회에 실패했습니다. 수입 관측값은 변경하지 않습니다.'}
-                trades[country]['missing_diagnostics'] = diagnosis
-                trades[country]['sources'].extend(diagnosis.get('sources', []))
-                factor = trades[country]['factor']
-                factor.setdefault('checks', []).extend(
-                    {'label': f'{d["period"]} 수입 자료 확인', 'status': d['diagnostic_status'], 'detail': d['reason']}
-                    for d in diagnosis.get('diagnostics', []))
-                if diagnosis.get('reason'):
-                    factor.setdefault('warnings', []).append(diagnosis['reason'])
-                if diagnosis.get('warning'):
-                    factor.setdefault('warnings', []).append(diagnosis['warning'])
-                by_period = {d['period']: d for d in diagnosis.get('diagnostics', [])}
-                for observation in trades[country].get('monthly_imports', []):
-                    diagnostic = by_period.get(observation.get('period'))
-                    if diagnostic and observation.get('status') == 'MISSING':
-                        observation['reason'] = diagnostic['reason']
-                        observation['evidence'] = observation.get('evidence', []) + diagnostic.get('evidence', [])
+                trades[country] = self._collect_country(scoped, progress)
             progress('5개 후보국의 공통 기간과 제외 사유를 확인합니다.')
             try:
                 comparison = select_comparisons(trades, inputs)
@@ -326,7 +340,7 @@ class CompanyAnalysis:
             trade['stability_window'] = country_window(comparison['stability'], inputs['country'])
             progress('한국 전체 수출 기준단가의 자료 범위를 확인합니다.')
             try:
-                trade['world_reference'] = self._reference(inputs, progress)
+                trade['world_reference'] = prepared['reference'] if 'reference' in prepared else self._reference(inputs, progress)
             except InterruptedError:
                 raise
             except Exception:
@@ -335,7 +349,7 @@ class CompanyAnalysis:
             from .analysis_fx import collect_fx
             progress('기업 거래의 결제통화와 일별 환율을 확인합니다.')
             try:
-                fx = (self.fx_collector or collect_fx)(company, inputs, self.key_provider(), progress=progress)
+                fx = prepared['fx'] if 'fx' in prepared else (self.fx_collector or collect_fx)(company, inputs, self.key_provider(), progress=progress)
             except InterruptedError:
                 raise
             except Exception:
@@ -344,7 +358,7 @@ class CompanyAnalysis:
             trade['fx'] = fx
             progress('공식 현행 고시의 판본과 본문을 확인합니다.')
             try:
-                law_snapshot = self._law(inputs, progress)
+                law_snapshot = prepared['law'] if 'law' in prepared else self._law(inputs, progress)
             except InterruptedError:
                 raise
             except Exception:

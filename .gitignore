@@ -22,3 +22,7 @@ instance/
 
 # Nested repository created inside the project; keep it out of this repository.
 /semiconductor-trade-project-1st/
+
+# Generated reports and PDF review images.
+/output/
+/tmp/pdfs/

@@ -226,6 +226,11 @@ class MarketStore:
                     ON market_assessments(user_id, created_at DESC);
                 CREATE UNIQUE INDEX IF NOT EXISTS market_one_active_per_user
                     ON market_assessments(user_id) WHERE status IN ('QUEUED','RUNNING');
+                CREATE TABLE IF NOT EXISTS analysis_steps (
+                    assessment_id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
+                    data_json TEXT NOT NULL, lease_until REAL NOT NULL,
+                    lease_token TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS workspace_source_deletions (
                     user_id TEXT NOT NULL, item_id TEXT NOT NULL, company_id TEXT NOT NULL,
                     PRIMARY KEY(user_id,item_id)
@@ -282,13 +287,16 @@ class MarketStore:
             # another 15 minutes. Allow a small margin for request startup.
             cutoff = datetime.fromtimestamp(time.time() - 330, timezone.utc).isoformat()
             db.execute("UPDATE market_assessments SET status='FAILED', progress=?, error=?, updated_at=? "
-                       "WHERE status IN ('QUEUED','RUNNING') AND created_at < ?",
+                       "WHERE status IN ('QUEUED','RUNNING') AND created_at < ? "
+                       "AND id NOT IN (SELECT assessment_id FROM analysis_steps)",
                        ('서버 실행 시간 제한으로 분석이 중단되었습니다. 같은 조건으로 다시 시도해 주세요.',
                         'job_interrupted', timestamp(), cutoff))
         db.execute("UPDATE market_assessments SET status='FAILED', progress=?, error=?, updated_at=? "
                    "WHERE status IN ('QUEUED','RUNNING') AND started < ?",
                    ('작업 시간이 초과되었습니다. 새 평가를 실행해 주세요.', 'job_interrupted',
                     timestamp(), time.time() - 900))
+        db.execute("DELETE FROM analysis_steps WHERE assessment_id IN "
+                   "(SELECT id FROM market_assessments WHERE status NOT IN ('QUEUED','RUNNING'))")
 
     def add_source(self, user_id, name, content, summary):
         source_id = str(uuid4())

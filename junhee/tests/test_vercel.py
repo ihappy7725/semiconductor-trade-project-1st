@@ -189,7 +189,7 @@ class PostgresIntegration(unittest.TestCase):
         downloaded = client.get(f'/api/analysis/sources/{source_id}/file')
         self.assertEqual(downloaded.status_code, 200)
         self.assertEqual(downloaded.data, content)
-        # Complete the real engine in the request, without calling external APIs.
+        # Complete the real engine across bounded requests, without external APIs.
         import requests
         svc = app.extensions['junhee_analysis']
         svc.repository = None
@@ -199,8 +199,12 @@ class PostgresIntegration(unittest.TestCase):
                                    json={'company_id': 'upload:' + source_id, 'company': '테스트 기업',
                                          'hs': '854232', 'country': 'US'})
         self.assertEqual(assessed.status_code, 202, assessed.get_json())
-        self.assertEqual(assessed.get_json()['status'], 'COMPLETED', assessed.get_json())
+        self.assertEqual(assessed.get_json()['status'], 'QUEUED', assessed.get_json())
         aid = assessed.get_json()['assessment_id']
+        for _ in range(9):
+            assessed = client.post(f'/api/analysis/assessments/{aid}/advance', headers=headers)
+            self.assertEqual(assessed.status_code, 200, assessed.get_json())
+        self.assertEqual(assessed.get_json()['status'], 'COMPLETED', assessed.get_json())
         from junhee.server.analysis import JunheeAnalysis
         another_instance = JunheeAnalysis('/read-only/another.db', svc.root, lambda: {}, inline=True)
         self.assertEqual(another_instance.handoff(USER['id'], None, aid)['schema'], 'handoff-v1')

@@ -44,11 +44,13 @@ _COMTRADE_LOCK = Lock()
 _COMTRADE_NEXT_AT = 0.0
 
 
-def _wait_comtrade_turn():
+def _wait_comtrade_turn(session=None):
     """Space request starts across collectors in this process, including retries."""
     global _COMTRADE_NEXT_AT
     with _COMTRADE_LOCK:
         delay = _COMTRADE_NEXT_AT - time.monotonic()
+        if session is not None and delay >= getattr(session, 'remaining', float('inf')):
+            raise requests.Timeout('collection_step_budget_exhausted')
         if delay > 0:
             time.sleep(delay)
         _COMTRADE_NEXT_AT = time.monotonic() + COMTRADE_MIN_INTERVAL
@@ -164,12 +166,15 @@ def _fetch(session, url, params, provider, source_id, api_keys):
         'source_release_at': None, 'adapter_version': MODULE_VERSION,
     }
     for attempt in range(2):
+        if getattr(session, 'remaining', float('inf')) < 0.1:
+            source['reason'] = '외부 자료 조회 시간 한도를 초과했습니다. 확인하지 못한 값은 자료 부족으로 표시합니다.'
+            return None, source
         response = None
         retry = False
         retry_delay = 2.0
         try:
             if is_comtrade:
-                _wait_comtrade_turn()
+                _wait_comtrade_turn(session)
             response = session.get(url, params=params,
                                    headers={'Accept': 'application/json, application/xml, text/xml'},
                                    timeout=TIMEOUT, allow_redirects=False)
