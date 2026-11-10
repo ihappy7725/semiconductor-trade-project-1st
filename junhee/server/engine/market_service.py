@@ -17,7 +17,7 @@ from uuid import uuid4
 
 from .market_data import collect_market, validate_inputs
 from .market_wsts import MAX_FILE_BYTES, parse_wsts
-from ..database import connect, prepare_directory
+from ..database import connect, prepare_directory, is_vercel
 
 
 class MarketError(Exception):
@@ -276,6 +276,15 @@ class MarketStore:
     @staticmethod
     def expire(db):
         # A stopped process must not leave a user permanently locked out.
+        if is_vercel():
+            # Vercel terminates this synchronous request at 300 seconds. A
+            # heartbeat near termination must not keep a dead job alive for
+            # another 15 minutes. Allow a small margin for request startup.
+            cutoff = datetime.fromtimestamp(time.time() - 330, timezone.utc).isoformat()
+            db.execute("UPDATE market_assessments SET status='FAILED', progress=?, error=?, updated_at=? "
+                       "WHERE status IN ('QUEUED','RUNNING') AND created_at < ?",
+                       ('서버 실행 시간 제한으로 분석이 중단되었습니다. 같은 조건으로 다시 시도해 주세요.',
+                        'job_interrupted', timestamp(), cutoff))
         db.execute("UPDATE market_assessments SET status='FAILED', progress=?, error=?, updated_at=? "
                    "WHERE status IN ('QUEUED','RUNNING') AND started < ?",
                    ('작업 시간이 초과되었습니다. 새 평가를 실행해 주세요.', 'job_interrupted',

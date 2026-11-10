@@ -310,8 +310,24 @@ def create_assessment():
     except MarketError as exc:
         running = service().running_for(current_user()['id'], payload) if exc.code == 'analysis_running' else None
         if running is None:
+            if exc.code == 'analysis_running':
+                active = next((item for item in service().store.list(current_user()['id'])
+                               if item['status'] in ('QUEUED', 'RUNNING')), None)
+                if active:
+                    return jsonify(error=exc.code, message=exc.message, active=_status(active)), 409
             raise
         return jsonify(_status(running)), 202  # 같은 조건의 진행 중 분석을 이어서 기다린다
+
+
+@bp.post('/api/analysis/assessments/<assessment_id>/cancel')
+def cancel_assessment(assessment_id):
+    if not UUID.fullmatch(assessment_id):
+        raise MarketError('not_found', '분석을 찾을 수 없습니다.', 404)
+    user_id = current_user()['id']
+    service().store.get(user_id, assessment_id)  # Ownership check before changing state.
+    service().store.update(user_id, assessment_id, 'FAILED',
+                           '사용자가 이전 분석을 중단했습니다.', error='user_cancelled')
+    return jsonify(_status(service().store.get(user_id, assessment_id)))
 
 
 @bp.delete('/api/analysis/sources/<source_id>')

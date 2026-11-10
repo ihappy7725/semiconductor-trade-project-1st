@@ -13,8 +13,46 @@
     assessment_not_found: "분석 기록을 찾지 못했습니다(서버 재시작 등). 다시 분석해 주세요.",
     not_found: "저장된 분석 결과를 찾지 못했습니다. 다시 분석해 주세요.",
     request_failed: "서버와 통신하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+    analysis_running: "이 계정의 다른 분석이 진행 중입니다. 완료 후 다시 시도해 주세요. 중단된 작업은 서버 실행 제한이 지나면 자동으로 해제됩니다.",
+    analysis_busy: "다른 분석 작업을 처리 중입니다. 잠시 후 다시 시도해 주세요.",
   };
   const readable = (e, fallback) => message(e, CODE_TEXT[e && e.message] || fallback);
+  async function request(url, opts = {}, timeout = 30000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    try {
+      return await auth.api(url, { ...opts, signal: controller.signal });
+    } catch (e) {
+      if (controller.signal.aborted || e.status === 504) {
+        throw new Error("분석 서버의 응답 대기 시간이 초과되었습니다. 서버에서 계속 처리 중일 수 있습니다. 잠시 후 같은 파일과 조건으로 다시 시도해 주세요.");
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function submit(inputs, progress) {
+    const url = "/api/analysis/assessments";
+    try {
+      return await request(url, { method: "POST", json: inputs }, 310000);
+    } catch (e) {
+      const active = e.data && e.data.active;
+      if (e.status !== 409 || e.message !== "analysis_running" || !active) throw e;
+      const prompt = {
+        title: "이전 분석이 남아 있습니다",
+        message: `이전 작업 상태: ${active.progress || "분석 중"}. 이전 분석을 중단하고 지금 선택한 파일로 새 분석을 시작할까요?`,
+        ok: "이전 분석 중단 후 시작", cancel: "돌아가기",
+      };
+      const replace = window.JunheeDashboard
+        ? await window.JunheeDashboard.confirm(prompt)
+        : window.confirm(prompt.message);
+      if (!replace) throw new Error("새 분석을 시작하지 않았습니다. 이전 분석과 같은 파일·조건으로 실행하면 진행 상황을 확인할 수 있습니다.");
+      progress("이전 분석을 중단하고 새 분석을 시작합니다…");
+      await request(`${url}/${encodeURIComponent(active.assessment_id)}/cancel`, { method: "POST" });
+      return await request(url, { method: "POST", json: inputs }, 310000);
+    }
+  }
 
   async function upload(raw, name) {
     const fd = new FormData();
@@ -39,28 +77,39 @@
     if (!companyId) throw new Error("원본 파일이 서버에 없습니다. 파일을 다시 올려 주세요.");
     // (2026-09-27) 결측 확인: 빈 칸·빠진 시트가 있으면 어느 셀인지와 점수 영향을 보여 주고 진행 여부를 묻는다(값을 채우지 않음)
     progress("파일의 빈 칸을 확인합니다…");
-    const chk = await auth.api("/api/analysis/inspect?company_id=" + encodeURIComponent(companyId)).catch(() => null);
+    const chk = await request("/api/analysis/inspect?company_id=" + encodeURIComponent(companyId)).catch(() => null);
     if (chk && (chk.fields.length || chk.missing_sheets.length || chk.issues.length) && window.JunheeDashboard && !(await confirmMissing(chk))) {
       const e = new Error("결측 확인 후 분석을 취소했습니다. 파일을 보완해 다시 올리거나 '그래도 진행'을 선택하세요.");
       e.cancelled = true;
       throw e;
     }
-    progress("분석을 시작합니다…");
+    const started = Date.now();
+    const deadline = started + 6 * 60 * 1000;
+    const waiting = () => progress(`5개국 무역통계·환율·규제 자료를 조회하고 분석합니다… (${Math.floor((Date.now() - started) / 1000)}초 경과)`);
+    waiting();
+    // Vercel executes the analysis inside this POST (up to 300 seconds).
+    // Keep feedback and a request deadline active before polling starts too.
+    const feedback = setInterval(waiting, 1000);
     let st;
     try {
-      st = await auth.api("/api/analysis/assessments", { method: "POST", json: { company_id: companyId, company: cond.company, hs: cond.hs, country: cond.country } });
+      st = await submit({ company_id: companyId, company: cond.company, hs: cond.hs, country: cond.country }, progress);
     } catch (e) {
       if (e.status === 404) { delete file.source_id; throw new Error("서버에 원본 파일이 없습니다(서버 재시작 등). 파일을 다시 올려 주세요."); }
-      throw new Error(message(e, "분석을 시작하지 못했습니다."));
+      const fallback = e.status === 502 || e.status === 503
+        ? "분석 서버에 일시적인 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
+        : e.status === 403 ? "로그인 보안 정보가 만료되었습니다. 페이지를 새로고침한 뒤 다시 시도해 주세요."
+        : e.message !== "request_failed" ? e.message : "서버와 통신하지 못했습니다. 잠시 후 다시 시도해 주세요.";
+      throw new Error(readable(e, fallback || "분석을 시작하지 못했습니다."));
+    } finally {
+      clearInterval(feedback);
     }
-    const started = Date.now();
     let fails = 0; // (2026-09-27 배포 QA) 일시 오류(5xx·429·네트워크)는 간격을 늘려 다시 묻는다. 404 등은 바로 중단
     while (st.status === "QUEUED" || st.status === "RUNNING") {
       progress(st.progress || "분석 중입니다…");
-      if (Date.now() - started > 6 * 60 * 1000) throw new Error("분석이 너무 오래 걸립니다. 서버에서는 계속 진행될 수 있으니 잠시 후 같은 조건으로 다시 분석하면 이어서 확인합니다.");
+      if (Date.now() >= deadline) throw new Error("분석이 너무 오래 걸립니다. 서버에서는 계속 진행될 수 있으니 잠시 후 같은 조건으로 다시 분석하면 이어서 확인합니다.");
       await sleep(fails ? Math.min(1500 * 2 ** fails, 12000) : 1500);
       try {
-        st = await auth.api(`/api/analysis/assessments/${st.assessment_id}`);
+        st = await request(`/api/analysis/assessments/${st.assessment_id}`, {}, Math.max(1, Math.min(30000, deadline - Date.now())));
         fails = 0;
       } catch (e) {
         const transient = !e.status || e.status >= 500 || e.status === 429;
