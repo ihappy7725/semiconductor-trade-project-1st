@@ -25,6 +25,7 @@ import re
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from uuid import uuid4
 
 from flask import Blueprint, current_app, jsonify, request, send_file
@@ -192,33 +193,48 @@ class JunheeAnalysis(CompanyAnalysis):
                 return fallback
         try:
             self.tokens[user_id] = token
-            with BudgetSession(60) as session:
-                remaining = [c for c in CANDIDATES if c not in prepared['trades']]
-                if remaining:
-                    country = remaining[0]
-                    progress(f'{COUNTRY_NAMES[country]} 비교 자료를 확인합니다. ({len(prepared["trades"]) + 1}/{len(CANDIDATES)})')
-                    prepared['trades'][country] = self._collect_country(
-                        {**inputs, 'country': country, 'country_name': COUNTRY_NAMES[country]}, progress, session=session)
-                elif 'reference' not in prepared:
-                    progress('한국 전체 수출 기준자료를 확인합니다. (6/9)')
-                    prepared['reference'] = collect(lambda: self._reference(inputs, progress, session=session),
-                        {'monthly_exports': [], 'sources': [], 'status': 'FETCH_ERROR',
-                         'warnings': ['한국 전체 수출 기준자료를 확인하지 못했습니다.']})
-                elif 'fx' not in prepared:
-                    progress('결제통화와 환율을 확인합니다. (7/9)')
-                    prepared['fx'] = collect(lambda: (
-                        self.fx_collector(company, inputs, self.key_provider(), progress=progress)
-                        if self.fx_collector else collect_fx(company, inputs, self.key_provider(), progress=progress, session=session)),
-                        {'metrics': [], 'sources': [], 'warnings': ['결제통화 환율 자료를 확인하지 못했습니다.'],
-                         'checks': [], 'series': [], 'calendar_status': 'UNVERIFIED'})
-                elif 'law' not in prepared:
-                    progress('공식 규제 자료를 확인합니다. (8/9)')
-                    prepared['law'] = collect(lambda: self._law(inputs, progress, session=session),
-                        {'status': 'FETCH_ERROR', 'law': None, 'sources': [], 'checks': [],
-                         'warnings': ['공식 고시 원문을 조회하지 못했습니다. 보유 원문의 효력을 추정하지 않습니다.']})
-                else:
-                    progress('수집된 근거로 보고서를 작성합니다. (9/9)')
-                    self.run(user_id, assessment_id, inputs, company, prepared=prepared)
+            blocked = data.setdefault('provider_blocks', {})
+            remaining = [c for c in CANDIDATES if c not in prepared['trades']]
+            if remaining:
+                progress('5개국 비교 자료를 함께 확인합니다. (1/3)')
+                def country_data(country):
+                    # Every task owns a session; provider pacing in
+                    # market_data still limits Comtrade request starts.
+                    with BudgetSession(60, blocked=blocked) as country_session:
+                        return self._collect_country(
+                            {**inputs, 'country': country, 'country_name': COUNTRY_NAMES[country]},
+                            lambda message: progress(f'{COUNTRY_NAMES[country]} · {message}'), session=country_session)
+                # Join all tasks before returning the HTTP response.
+                with ThreadPoolExecutor(max_workers=len(remaining), thread_name_prefix='public-country') as executor:
+                    pending = {executor.submit(country_data, c): c for c in remaining}
+                    for future in as_completed(pending):
+                        prepared['trades'][pending[future]] = future.result()
+                        progress(f'비교국 자료 {len(prepared["trades"])}/{len(CANDIDATES)}개 확인을 마쳤습니다. (1/3)')
+            elif any(key not in prepared for key in ('reference', 'fx', 'law')):
+                progress('수출 기준자료·환율·규제를 함께 확인합니다. (2/3)')
+                def supplement(key):
+                    with BudgetSession(60, blocked=blocked) as supplement_session:
+                        if key == 'reference':
+                            return collect(lambda: self._reference(inputs, progress, session=supplement_session),
+                                {'monthly_exports': [], 'sources': [], 'status': 'FETCH_ERROR',
+                                 'warnings': ['한국 전체 수출 기준자료를 확인하지 못했습니다.']})
+                        if key == 'fx':
+                            return collect(lambda: (
+                                self.fx_collector(company, inputs, self.key_provider(), progress=progress)
+                                if self.fx_collector else collect_fx(company, inputs, self.key_provider(), progress=progress, session=supplement_session)),
+                                {'metrics': [], 'sources': [], 'warnings': ['결제통화 환율 자료를 확인하지 못했습니다.'],
+                                 'checks': [], 'series': [], 'calendar_status': 'UNVERIFIED'})
+                        return collect(lambda: self._law(inputs, progress, session=supplement_session),
+                            {'status': 'FETCH_ERROR', 'law': None, 'sources': [], 'checks': [],
+                             'warnings': ['공식 고시 원문을 조회하지 못했습니다. 보유 원문의 효력을 추정하지 않습니다.']})
+                keys = [k for k in ('reference', 'fx', 'law') if k not in prepared]
+                with ThreadPoolExecutor(max_workers=len(keys), thread_name_prefix='analysis-supplement') as executor:
+                    pending = {executor.submit(supplement, key): key for key in keys}
+                    for future in as_completed(pending):
+                        prepared[pending[future]] = future.result()
+            else:
+                progress('수집된 근거로 보고서를 작성합니다. (3/3)')
+                self.run(user_id, assessment_id, inputs, company, prepared=prepared)
             # Raw response bodies are not inputs to calculation or rendering.
             def compact(value):
                 if isinstance(value, dict):

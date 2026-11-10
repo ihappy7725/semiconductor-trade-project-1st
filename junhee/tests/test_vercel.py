@@ -201,7 +201,7 @@ class PostgresIntegration(unittest.TestCase):
         self.assertEqual(assessed.status_code, 202, assessed.get_json())
         self.assertEqual(assessed.get_json()['status'], 'QUEUED', assessed.get_json())
         aid = assessed.get_json()['assessment_id']
-        for _ in range(9):
+        for _ in range(3):
             assessed = client.post(f'/api/analysis/assessments/{aid}/advance', headers=headers)
             self.assertEqual(assessed.status_code, 200, assessed.get_json())
         self.assertEqual(assessed.get_json()['status'], 'COMPLETED', assessed.get_json())

@@ -402,7 +402,7 @@ def rebase_market(trade, inputs, annual_year, latest_month):
     return result
 
 
-def collect_trade(inputs, keys, progress=None, session=None):
+def collect_trade(inputs, keys, progress=None, session=None, prior=None):
     """Read five annual and 60 calendar months of imports, plus 24+ KCS months.
 
     KCS also covers the preceding complete calendar year so a not-yet-published
@@ -417,6 +417,36 @@ def collect_trade(inputs, keys, progress=None, session=None):
     kcs_periods = _months(f'{year - 1}-01', _month(-1, as_of))
     monthly, annual, kcs, sources = {}, {}, {}, []
     safe_keys = {name: keys.get(name, '') for name in ('UN_COMTRADE_API_KEY', 'KCS_TRADE_API_KEY')}
+    prior = prior or {}
+    prior_sources = {s['id']: s for s in prior.get('sources', [])}
+    reused_sources = set()
+
+    def reuse(field, periods):
+        """Reuse only independently validated observations and their evidence.
+
+        Failed periods remain retryable even when other periods were saved.
+        A fresh failed batch must not extend the age of older observations.
+        """
+        output = {}
+        now = datetime.now(timezone.utc)
+        frequency = 'A' if field == 'annual_imports' else 'M'
+        for row in _observation_index(prior.get(field, []), frequency).values():
+            if row['period'] not in periods or row.get('status') not in VALID | {'MISSING'}:
+                continue
+            refs = {e.get('source_id') for e in row.get('evidence', [])}
+            if not refs or not refs <= prior_sources.keys():
+                continue
+            try:
+                fresh = all(0 <= (now - datetime.fromisoformat(prior_sources[s]['retrieved_at'].replace('Z', '+00:00'))).total_seconds() < 86400
+                            and prior_sources[s].get('status') in VALID | {'MISSING', 'PARTIAL', 'RECEIVED'} for s in refs)
+            except (KeyError, ValueError, TypeError):
+                fresh = False
+            if fresh:
+                output[row['period']] = deepcopy(row)
+                for sid in refs - reused_sources:
+                    sources.append(deepcopy(prior_sources[sid]))
+                    reused_sources.add(sid)
+        return output
 
     def fetch(url, params, provider, sid, key_name):
         if not safe_keys[key_name]:
@@ -424,6 +454,10 @@ def collect_trade(inputs, keys, progress=None, session=None):
         return _fetch(session, url, params, provider, sid, safe_keys)
 
     def comtrade(periods, frequency):
+        cached = reuse('annual_imports' if frequency == 'A' else 'monthly_imports', periods)
+        periods = [p for p in periods if p not in cached]
+        if not periods:
+            return cached
         sid = f'comtrade-{inputs["country"]}-{inputs["hs6"]}-{frequency}-{periods[0]}-{periods[-1]}'
         if progress:
             progress(f'{inputs.get("country_name", inputs["country"])} 수입 {periods[0]}~{periods[-1]} 확인')
@@ -438,21 +472,27 @@ def collect_trade(inputs, keys, progress=None, session=None):
         result = _trade_batch(content, source, inputs, periods, frequency)
         source['status'] = _batch_status(result)
         sources.append(source)
-        return result
+        return {**cached, **result}
 
     try:
-        for y in range(year - 4, year + 1):
-            period = str(y)
-            annual.update(comtrade([period], 'A') if y >= 2022 else {
-                period: _obs(period, status='INCOMPATIBLE_SCOPE', reason='HS2022 시행 전 연도는 자동 연결하지 않습니다.')})
-        for y in sorted({p[:4] for p in monthly_periods}):
+        # The API accepts multiple periods (up to 12). Fetch annual years once.
+        # https://uncomtrade.org/docs/data/
+        compatible = [str(y) for y in range(year - 4, year + 1) if y >= 2022]
+        annual.update(comtrade(compatible, 'A') if compatible else {})
+        annual.update({str(y): _obs(str(y), status='INCOMPATIBLE_SCOPE', reason='HS2022 시행 전 연도는 자동 연결하지 않습니다.')
+                       for y in range(year - 4, year + 1) if y < 2022})
+        for y in sorted({p[:4] for p in monthly_periods}, reverse=True):
             periods = [p for p in monthly_periods if p[:4] == y]
             if int(y) < 2022:
                 monthly.update({p: _obs(p, status='INCOMPATIBLE_SCOPE', reason='HS2022 시행 전 자료입니다.') for p in periods})
             else:
                 monthly.update(comtrade(periods, 'M'))
-        for y in sorted({p[:4] for p in kcs_periods}):
+        for y in sorted({p[:4] for p in kcs_periods}, reverse=True):
             periods = [p for p in kcs_periods if p[:4] == y]
+            cached_kcs = reuse('kcs_exports', periods)
+            if len(cached_kcs) == len(periods):
+                kcs.update(cached_kcs)
+                continue
             if int(y) < 2022:
                 kcs.update({p: _obs(p, status='INCOMPATIBLE_SCOPE', reason='HS2022 시행 전 자료입니다.') for p in periods})
                 continue

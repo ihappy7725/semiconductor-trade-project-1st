@@ -173,6 +173,9 @@ def _fetch(session, url, params, provider, source_id, api_keys):
         retry = False
         retry_delay = 2.0
         try:
+            check = getattr(session, 'check_provider', None)
+            if callable(check):
+                check(url, params)
             if is_comtrade:
                 _wait_comtrade_turn(session)
             response = session.get(url, params=params,
@@ -194,9 +197,11 @@ def _fetch(session, url, params, provider, source_id, api_keys):
                 return content, source
             else:
                 break
-        except requests.RequestException:
+        except requests.RequestException as exc:
             # RequestException may contain the authenticated URL: never expose it.
-            retry = True
+            retry = getattr(exc, 'retryable', True)
+            if getattr(exc, 'http_status', None) is not None:
+                source['http_status'] = exc.http_status
         finally:
             if response is not None:
                 response.close()

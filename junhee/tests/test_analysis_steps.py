@@ -4,8 +4,9 @@ import os
 from pathlib import Path
 import tempfile
 import time
+from threading import Barrier
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 from flask import Flask
 import requests
@@ -47,11 +48,11 @@ class StepAnalysisTests(unittest.TestCase):
     def test_resume_in_new_instances_and_complete_report_without_network(self):
         aid = self.start()
         with patch('requests.sessions.Session.request', side_effect=AssertionError('unexpected HTTP')):
-            for step in range(9):
+            for step in range(3):
                 # Each request can land on a different serverless instance.
                 svc = analysis.JunheeAnalysis(self.db, ROOT, lambda: {}, inline=True)
                 item = svc.advance('owner', 'token', aid)
-                self.assertEqual(item['status'], 'COMPLETED' if step == 8 else 'RUNNING', item)
+                self.assertEqual(item['status'], 'COMPLETED' if step == 2 else 'RUNNING', item)
         doc = svc.handoff('owner', None, aid)
         self.assertEqual(doc['schema'], 'handoff-v1')
         self.assertEqual(doc['company_name'], 'AX 반도체')
@@ -68,6 +69,54 @@ class StepAnalysisTests(unittest.TestCase):
             self.svc.advance('owner', 'token', aid)
             collect.assert_not_called()
 
+    def test_five_country_collectors_run_concurrently(self):
+        aid = self.start()
+        barrier = Barrier(5, timeout=3)
+        original = self.svc._collect_country
+        def collect(*args, **kwargs):
+            barrier.wait()
+            return original(*args, **kwargs)
+        with patch.object(self.svc, '_collect_country', side_effect=collect):
+            item = self.svc.advance('owner', 'token', aid)
+        self.assertEqual(item['status'], 'RUNNING')
+        with self.svc.store.connection() as db:
+            data = json.loads(db.execute('SELECT data_json FROM analysis_steps WHERE assessment_id=?', (aid,)).fetchone()[0])
+        self.assertEqual(set(data['prepared']['trades']), {'US', 'CN', 'JP', 'DE', 'VN'})
+
+    def test_partial_trade_snapshot_keeps_valid_periods_and_retries_failures(self):
+        from datetime import datetime, timezone
+        aid = self.start()
+        inputs = self.svc.store.get('owner', aid)['inputs']
+        snapshot = {'monthly_imports': [{'period': '2026-09', 'status': 'OBSERVED', 'value': 10}],
+                    'annual_imports': [], 'kcs_exports': [{'period': '2026-09', 'status': 'FETCH_ERROR', 'value': None}],
+                    'sources': [{'id': 'known', 'provider': 'UN Comtrade', 'status': 'OBSERVED',
+                                 'retrieved_at': datetime.now(timezone.utc).isoformat(), 'raw': 'not needed'}]}
+        self.svc.trade_collector = Mock(return_value=snapshot)
+        self.svc._trade(inputs, lambda text: None)
+        self.svc.trade_collector = None
+        with patch('junhee.server.engine.analysis_market_price.collect_trade', return_value=snapshot) as collector:
+            self.svc._trade(inputs, lambda text: None)
+        collector.assert_called_once()
+        prior = collector.call_args.kwargs['prior']
+        self.assertEqual(prior['monthly_imports'][0]['value'], 10)
+        self.assertEqual(prior['kcs_exports'][0]['status'], 'FETCH_ERROR')
+        self.assertNotIn('raw', prior['sources'][0])
+
+    def test_independent_supplements_run_concurrently(self):
+        aid = self.start()
+        self.svc.advance('owner', 'token', aid)
+        barrier = Barrier(3, timeout=3)
+        def supplement(*args, **kwargs):
+            barrier.wait()
+            return {'status': 'FETCH_ERROR', 'sources': []}
+        self.svc.fx_collector = supplement
+        with patch.object(self.svc, '_reference', side_effect=supplement), patch.object(self.svc, '_law', side_effect=supplement):
+            item = self.svc.advance('owner', 'token', aid)
+        self.assertEqual(item['status'], 'RUNNING')
+        with self.svc.store.connection() as db:
+            data = json.loads(db.execute('SELECT data_json FROM analysis_steps WHERE assessment_id=?', (aid,)).fetchone()[0])
+        self.assertTrue({'reference', 'fx', 'law'} <= data['prepared'].keys())
+
     def test_steps_are_not_expired_by_original_five_minute_request_limit(self):
         aid = self.start()
         with self.svc.store.connection() as db:
@@ -79,7 +128,7 @@ class StepAnalysisTests(unittest.TestCase):
         with patch.object(self.svc, '_trade', side_effect=requests.Timeout()), \
              patch.object(self.svc, '_reference', side_effect=requests.Timeout()), \
              patch.object(self.svc, '_law', side_effect=requests.Timeout()):
-            for _ in range(9):
+            for _ in range(3):
                 item = self.svc.advance('owner', 'token', aid)
         self.assertEqual(item['status'], 'COMPLETED', item)
         self.assertIsNotNone(self.svc.handoff('owner', None, aid))
@@ -110,7 +159,7 @@ class StepAnalysisTests(unittest.TestCase):
             self.assertEqual(response.status_code, 202)
             self.assertEqual(response.json['status'], 'QUEUED')
             aid = response.json['assessment_id']
-            for _ in range(9):
+            for _ in range(3):
                 response = client.post(f'/api/analysis/assessments/{aid}/advance')
                 self.assertEqual(response.status_code, 200, response.json)
             self.assertEqual(response.json['status'], 'COMPLETED')

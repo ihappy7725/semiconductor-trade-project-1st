@@ -2,6 +2,7 @@
 """Enterprise upload -> one persisted assessment shared by the existing five tabs."""
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
@@ -186,25 +187,44 @@ class CompanyAnalysis:
             db.execute('CREATE TABLE IF NOT EXISTS analysis_trade_cache (key TEXT PRIMARY KEY, created REAL NOT NULL, result_json TEXT NOT NULL)')
             cached = db.execute('SELECT result_json FROM analysis_trade_cache WHERE key=? AND created>?',
                                 (cache_key, time.time() - 86400)).fetchone()
-        if cached:
+        prior = json.loads(cached['result_json']) if cached else None
+        if prior and self._trade_complete(prior):
             progress('같은 품목·국가의 저장된 공식통계 근거를 확인합니다.')
-            return json.loads(cached['result_json'])
+            return prior
+        if prior:
+            progress('확인된 통계는 재사용하고 미확인 기간만 조회합니다.')
         result = (self.trade_collector(inputs, self.key_provider(), progress=progress)
-                  if self.trade_collector else collect_trade(inputs, self.key_provider(), progress=progress, session=session))
+                  if self.trade_collector else collect_trade(inputs, self.key_provider(), progress=progress, session=session, prior=prior))
+        # Save confirmed periods even when another provider/period failed. The
+        # collector retries failures and checks each original source's age.
+        observations = result.get('monthly_imports', []) + result.get('kcs_exports', []) + result.get('annual_imports', [])
+        if any(o.get('status') in ('OBSERVED', 'OBSERVED_ZERO', 'MISSING') for o in observations):
+            def compact(value):
+                if isinstance(value, dict):
+                    return {k: compact(v) for k, v in value.items() if k != 'raw'}
+                return [compact(v) for v in value] if isinstance(value, list) else value
+            with self.store.connection() as db:
+                db.execute('INSERT OR REPLACE INTO analysis_trade_cache VALUES(?,?,?)',
+                           (cache_key, time.time(), json.dumps(compact(result), ensure_ascii=False, allow_nan=False)))
+        return result
+
+    @staticmethod
+    def _trade_complete(result):
         sources = result.get('sources', [])
         # A successful response can have unpublished months. Preserve those gaps
         # for the daily snapshot, but leave failed or invalid batches retryable.
         api_sources = [s for s in sources if s.get('provider') in ('UN Comtrade', '관세청', '검증 응답')]
         observations = result.get('monthly_imports', []) + result.get('kcs_exports', []) + result.get('annual_imports', [])
+        try:
+            fresh = all(0 <= (datetime.now(timezone.utc) - datetime.fromisoformat(s['retrieved_at'].replace('Z', '+00:00'))).total_seconds() < 86400
+                        for s in api_sources)
+        except (KeyError, ValueError, TypeError):
+            fresh = False
         valid_observations = all(o.get('status') in ('OBSERVED', 'OBSERVED_ZERO', 'MISSING', 'INCOMPATIBLE_SCOPE')
                                  for o in observations)
-        if (api_sources and valid_observations
+        return bool(api_sources and fresh and valid_observations
                 and all(s.get('status') in ('OBSERVED', 'OBSERVED_ZERO', 'RECEIVED', 'OK', 'MISSING', 'PARTIAL')
-                        for s in api_sources)):
-            with self.store.connection() as db:
-                db.execute('INSERT OR REPLACE INTO analysis_trade_cache VALUES(?,?,?)',
-                           (cache_key, time.time(), json.dumps(result, ensure_ascii=False, allow_nan=False)))
-        return result
+                        for s in api_sources))
 
     def _public_data(self, cache_key, collect):
         """Cache public-only supplements. Never pass company/FX results here."""

@@ -108,8 +108,18 @@
       progress(st.progress || "분석 중입니다…");
       if (Date.now() >= deadline) throw new Error("분석이 너무 오래 걸립니다. 서버에서는 계속 진행될 수 있으니 잠시 후 같은 조건으로 다시 분석하면 이어서 확인합니다.");
       await sleep(fails ? Math.min(1500 * 2 ** fails, 12000) : 1500);
-      const stageMessage = st.progress || "보고서 근거를 수집합니다…";
+      let stageMessage = st.progress || "보고서 근거를 수집합니다…";
+      let stageActive = true, polling = false;
       const stageFeedback = setInterval(() => progress(`${stageMessage} (${Math.floor((Date.now() - started) / 1000)}초 경과)`), 1000);
+      const liveStatus = st.stepwise ? setInterval(async () => {
+        if (polling) return;
+        polling = true;
+        try {
+          const live = await request(`/api/analysis/assessments/${encodeURIComponent(st.assessment_id)}`);
+          if (stageActive && live.progress) stageMessage = live.progress;
+        } catch { /* The advance request owns completion and retry handling. */ }
+        finally { polling = false; }
+      }, 8000) : null;
       try {
         const url = `/api/analysis/assessments/${encodeURIComponent(st.assessment_id)}`;
         st = st.stepwise
@@ -120,7 +130,9 @@
         const transient = !e.status || e.status >= 500 || e.status === 429;
         if (!transient || ++fails > 5) throw new Error(readable(e, "분석 진행 상태를 확인하지 못했습니다."));
       } finally {
+        stageActive = false;
         clearInterval(stageFeedback);
+        if (liveStatus) clearInterval(liveStatus);
       }
     }
     if (st.status !== "COMPLETED") throw new Error(st.progress || "분석을 완료하지 못했습니다.");
