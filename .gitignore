@@ -19,3 +19,6 @@ qa/
 instance/
 .vercel/
 .codex-runtime/
+
+# Nested repository created inside the project; keep it out of this repository.
+/semiconductor-trade-project-1st/
